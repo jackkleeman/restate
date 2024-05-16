@@ -14,6 +14,7 @@ pub mod config;
 pub mod deployments;
 pub mod examples;
 pub mod invocations;
+pub mod invoke;
 pub mod services;
 pub mod sql;
 pub mod state;

@@ -1,0 +1,176 @@
+// Copyright (c) 2023 -  Restate Software, Inc., Restate GmbH.
+// All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+//! A wrapper client for ingress HTTP service.
+
+use http::StatusCode;
+use serde::{de::DeserializeOwned, Serialize};
+use std::time::Duration;
+use thiserror::Error;
+use tracing::{debug, info};
+use url::Url;
+
+use crate::build_info;
+use crate::cli_env::CliEnv;
+
+use super::errors::ApiError;
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub enum Error {
+    // Error is boxed because ApiError can get quite large if the message body is large.
+    Api(#[from] Box<ApiError>),
+    #[error("(Protocol error) {0}")]
+    Serialization(#[from] serde_json::Error),
+    Network(#[from] reqwest::Error),
+}
+
+/// A lazy wrapper around a reqwest response that deserializes the body on
+/// demand and decodes our custom error body on non-2xx responses.
+pub struct Envelope<T> {
+    inner: reqwest::Response,
+
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> Envelope<T>
+where
+    T: DeserializeOwned,
+{
+    pub fn status_code(&self) -> StatusCode {
+        self.inner.status()
+    }
+
+    pub async fn into_body(self) -> Result<T, Error> {
+        let http_status_code = self.inner.status();
+        let url = self.inner.url().clone();
+        if !self.status_code().is_success() {
+            let body = self.inner.text().await?;
+            info!("Response from {} ({})", url, http_status_code);
+            info!("  {}", body);
+            // Wrap the error into ApiError
+            return Err(Error::Api(Box::new(ApiError {
+                http_status_code,
+                url,
+                body: serde_json::from_str(&body).unwrap_or(body.into()),
+            })));
+        }
+
+        debug!("Response from {} ({})", url, http_status_code);
+        let body = self.inner.text().await?;
+        debug!("  {}", body);
+        Ok(serde_json::from_str(&body)?)
+    }
+}
+
+impl<T> From<reqwest::Response> for Envelope<T> {
+    fn from(value: reqwest::Response) -> Self {
+        Self {
+            inner: value,
+            _phantom: Default::default(),
+        }
+    }
+}
+
+/// A handy client for the ingress HTTP service.
+#[derive(Clone)]
+pub struct IngressClient {
+    pub(crate) inner: reqwest::Client,
+    pub(crate) base_url: Url,
+    pub(crate) bearer_token: Option<String>,
+    pub(crate) request_timeout: Duration,
+}
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl IngressClient {
+    pub fn new(env: &CliEnv) -> anyhow::Result<Self> {
+        let raw_client = reqwest::Client::builder()
+            .user_agent(format!(
+                "{}/{} {}-{}",
+                env!("CARGO_PKG_NAME"),
+                build_info::RESTATE_CLI_VERSION,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ))
+            .connect_timeout(env.connect_timeout)
+            .build()?;
+
+        let base_url = env.ingress_base_url()?.clone();
+        let bearer_token = env.bearer_token()?.map(str::to_string);
+
+        Ok(Self {
+            inner: raw_client,
+            base_url,
+            bearer_token,
+            request_timeout: env.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+        })
+    }
+
+    /// Prepare a request builder for the given method and path.
+    fn prepare(&self, method: reqwest::Method, path: Url) -> reqwest::RequestBuilder {
+        let request_builder = self
+            .inner
+            .request(method, path)
+            .timeout(self.request_timeout);
+
+        match self.bearer_token.as_deref() {
+            Some(token) => request_builder.bearer_auth(token),
+            None => request_builder,
+        }
+    }
+
+    /// Prepare a request builder that encodes the body as JSON.
+    fn prepare_with_body<B>(
+        &self,
+        method: reqwest::Method,
+        path: Url,
+        body: B,
+    ) -> reqwest::RequestBuilder
+    where
+        B: Serialize,
+    {
+        self.prepare(method, path).json(&body)
+    }
+
+    /// Execute a request and return the response as a lazy Envelope.
+    pub(crate) async fn run<T>(&self, path: Url) -> reqwest::Result<Envelope<T>>
+    where
+        T: DeserializeOwned + Send,
+    {
+        debug!("Sending request POST ({})", path);
+        let request = self.prepare(reqwest::Method::POST, path.clone());
+        let resp = request.send().await?;
+        debug!("Response from {} ({})", path, resp.status());
+        Ok(resp.into())
+    }
+
+    pub(crate) async fn run_with_body<T, B>(
+        &self,
+        path: Url,
+        body: B,
+    ) -> reqwest::Result<Envelope<T>>
+    where
+        T: DeserializeOwned + Send,
+        B: Serialize + std::fmt::Debug + Send,
+    {
+        debug!("Sending request POST ({}): {:?}", path, body);
+        let request = self.prepare_with_body(reqwest::Method::POST, path.clone(), body);
+        let resp = request.send().await?;
+        debug!("Response from {} ({})", path, resp.status());
+        Ok(resp.into())
+    }
+}
+
+// Ensure that IngressClient is Send + Sync. Compiler will fail if it's not.
+const _: () = {
+    const fn assert_send<T: Send + Sync>() {}
+    assert_send::<IngressClient>();
+};

@@ -90,6 +90,8 @@ pub enum Command {
     /// Manage active invocations
     #[clap(subcommand)]
     Invocations(invocations::Invocations),
+    /// Make an invocation
+    Invoke(invoke::Invoke),
     /// Runs SQL queries against the data fusion service
     #[clap(hide = true)]
     Sql(sql::Sql),
