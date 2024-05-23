@@ -7,11 +7,11 @@ use assert2::let_assert;
 use async_stream::{stream, try_stream};
 use bytes::Bytes;
 use futures::{pin_mut, Stream, StreamExt};
-use http_body_util::{BodyStream, Either, Empty, Full, StreamBody};
+use http_body_util::{BodyStream, Either, Full, StreamBody};
+use hyper::{Request, Response};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use prost::Message;
 use tokio::net::TcpListener;
@@ -21,12 +21,12 @@ use tracing_subscriber::filter::LevelFilter;
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_service_protocol::message::{Decoder, Encoder, EncodingError, ProtocolMessage};
 use restate_types::errors::codes;
-use restate_types::journal::raw::{EntryHeader, PlainRawEntry, RawEntryCodecError};
 use restate_types::journal::{Entry, EntryType, InputEntry};
-use restate_types::service_protocol::start_message::StateEntry;
+use restate_types::journal::raw::{EntryHeader, PlainRawEntry, RawEntryCodecError};
 use restate_types::service_protocol::{
     self, get_state_entry_message, output_entry_message, ServiceProtocolVersion, StartMessage,
 };
+use restate_types::service_protocol::start_message::StateEntry;
 
 #[derive(Debug, thiserror::Error)]
 enum FrameError {
@@ -44,37 +44,26 @@ enum FrameError {
     Serde(#[from] serde_json::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("not found")]
+struct NotFound;
+
 async fn serve(
     req: Request<Incoming>,
 ) -> Result<
     Response<
-        Either<Empty<Bytes>, StreamBody<impl Stream<Item = Result<Frame<Bytes>, Infallible>>>>,
+        StreamBody<impl Stream<Item=Result<Frame<Bytes>, Infallible>>>,
     >,
-    Infallible,
+    NotFound,
 > {
     let (req_head, req_body) = req.into_parts();
     let mut split = req_head.uri.path().rsplit('/');
-    let handler_name = if let Some(handler_name) = split.next() {
-        handler_name
-    } else {
-        return Ok(Response::builder()
-            .status(404)
-            .body(Either::Left(Empty::new()))
-            .unwrap());
+    let handler: Handler = split.next().ok_or(NotFound)?.parse()?;
+    if let Some("Counter") = split.next() {} else {
+        return Err(NotFound);
     };
-    if let Some("Counter") = split.next() {
-    } else {
-        return Ok(Response::builder()
-            .status(404)
-            .body(Either::Left(Empty::new()))
-            .unwrap());
-    };
-    if let Some("invoke") = split.next() {
-    } else {
-        return Ok(Response::builder()
-            .status(404)
-            .body(Either::Left(Empty::new()))
-            .unwrap());
+    if let Some("invoke") = split.next() {} else {
+        return Err(NotFound);
     };
 
     let req_body = BodyStream::new(req_body);
@@ -103,17 +92,7 @@ async fn serve(
         }
     };
 
-    let handler: Handler = match handler_name.parse() {
-        Ok(handler) => handler,
-        Err(_err) => {
-            return Ok(Response::builder()
-                .status(404)
-                .body(Either::Left(Empty::new()))
-                .unwrap());
-        }
-    };
-
-    let outgoing = handler.handle(incoming).map(move |message| match message {
+     let outgoing = handler.handle(incoming).map(move |message| match message {
         Ok(message) => Ok(Frame::data(encoder.encode(message))),
         Err(err) => {
             error!("Error handling stream: {err:?}");
@@ -124,7 +103,7 @@ async fn serve(
     Ok(Response::builder()
         .status(200)
         .header("content-type", "application/vnd.restate.invocation.v1")
-        .body(Either::Right(StreamBody::new(outgoing)))
+        .body(StreamBody::new(outgoing))
         .unwrap())
 }
 
@@ -133,18 +112,14 @@ enum Handler {
     Add,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("Invalid handler")]
-struct InvalidHandler;
-
 impl FromStr for Handler {
-    type Err = InvalidHandler;
+    type Err = NotFound;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "get" => Ok(Self::Get),
             "add" => Ok(Self::Add),
-            _ => Err(InvalidHandler),
+            _ => Err(NotFound),
         }
     }
 }
@@ -161,8 +136,8 @@ impl Display for Handler {
 impl Handler {
     fn handle(
         self,
-        incoming: impl Stream<Item = Result<ProtocolMessage, FrameError>>,
-    ) -> impl Stream<Item = Result<ProtocolMessage, FrameError>> {
+        incoming: impl Stream<Item=Result<ProtocolMessage, FrameError>>,
+    ) -> impl Stream<Item=Result<ProtocolMessage, FrameError>> {
         try_stream! {
             pin_mut!(incoming);
             match (incoming.next().await, incoming.next().await) {
@@ -203,8 +178,8 @@ impl Handler {
         start_message: StartMessage,
         _input: InputEntry,
         replayed: Vec<ProtocolMessage>,
-        _incoming: impl Stream<Item = Result<ProtocolMessage, FrameError>>,
-    ) -> impl Stream<Item = Result<ProtocolMessage, FrameError>> {
+        _incoming: impl Stream<Item=Result<ProtocolMessage, FrameError>>,
+    ) -> impl Stream<Item=Result<ProtocolMessage, FrameError>> {
         try_stream! {
             let counter = read_counter(&start_message.state_map);
             match replayed.len() {
@@ -229,8 +204,8 @@ impl Handler {
         start_message: StartMessage,
         input: InputEntry,
         replayed: Vec<ProtocolMessage>,
-        _incoming: impl Stream<Item = Result<ProtocolMessage, FrameError>>,
-    ) -> impl Stream<Item = Result<ProtocolMessage, FrameError>> {
+        _incoming: impl Stream<Item=Result<ProtocolMessage, FrameError>>,
+    ) -> impl Stream<Item=Result<ProtocolMessage, FrameError>> {
         try_stream! {
                 let counter = read_counter(&start_message.state_map);
                 match replayed.len() {
@@ -312,8 +287,8 @@ fn get_state(counter: Option<Bytes>) -> ProtocolMessage {
                 None => get_state_entry_message::Result::Empty(service_protocol::Empty {}),
             }),
         }
-        .encode_to_vec()
-        .into(),
+            .encode_to_vec()
+            .into(),
     ))
 }
 
@@ -330,8 +305,8 @@ fn set_state(value: Bytes) -> ProtocolMessage {
             key: "counter".into(),
             value: value.clone(),
         }
-        .encode_to_vec()
-        .into(),
+            .encode_to_vec()
+            .into(),
     ))
 }
 
@@ -347,8 +322,8 @@ fn output(value: Bytes) -> ProtocolMessage {
             name: String::new(),
             result: Some(output_entry_message::Result::Value(value)),
         }
-        .encode_to_vec()
-        .into(),
+            .encode_to_vec()
+            .into(),
     ))
 }
 
@@ -378,6 +353,7 @@ fn error(err: FrameError) -> ProtocolMessage {
 }
 
 struct LossyDisplay<'a>(Option<&'a [u8]>);
+
 impl<'a> Display for LossyDisplay<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self.0 {
@@ -413,6 +389,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .timer(TokioTimer::new())
                 .serve_connection(io, service_fn(|req| async {
                     if req.uri().path() == "/discover" {
+                        info!("Responding to discovery request");
                         return Ok(Response::builder()
                             .header("content-type", "application/vnd.restate.endpointmanifest.v1+json")
                             .body(Either::Left(Full::new(Bytes::from(
@@ -420,12 +397,18 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             )))).unwrap());
                     }
 
-                    let (head, body) = serve(req).await?.into_parts();
+                    let (head, body) = match serve(req).await {
+                        Ok(resp) => resp,
+                        Err(NotFound) => return Ok(Response::builder()
+                            .status(404)
+                            .body(Either::Left(Full::new(Bytes::new())))
+                            .unwrap()),
+                    }.into_parts();
                     Result::<_, Infallible>::Ok(Response::from_parts(head, Either::Right(body)))
                 }))
                 .await
             {
-                println!("Error serving connection: {:?}", err);
+                error!("Error serving connection: {:?}", err);
             }
         });
     }
