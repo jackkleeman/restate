@@ -42,10 +42,13 @@ pub fn create_tonic_channel_from_advertised_address(address: AdvertisedAddress) 
                 }))
         }
         AdvertisedAddress::Http(uri) => {
+            let timeout = std::env::var("TONIC_CONNECT_TIMEOUT_MILLIS")
+                .ok()
+                .and_then(|t| u64::from_str_radix(&t, 10).ok())
+                .unwrap_or(100);
             // todo: Make the channel settings configurable
             Channel::builder(uri)
-                .connect_timeout(Duration::from_secs(5))
-                // todo: configure the channel from configuration file
+                .connect_timeout(Duration::from_millis(timeout))
                 .http2_adaptive_window(true)
                 .connect_lazy()
         }
